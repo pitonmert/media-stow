@@ -19,6 +19,21 @@ public class VerifySummary
     [JsonPropertyName("unmatched_files")]
     public int UnmatchedFiles { get; set; }
 
+    [JsonPropertyName("missing_source_files")]
+    public int MissingSourceFiles { get; set; }
+
+    [JsonPropertyName("ignored_files")]
+    public int IgnoredFiles { get; set; }
+
+    [JsonPropertyName("naming_errors")]
+    public int NamingErrors { get; set; }
+
+    [JsonPropertyName("location_errors")]
+    public int LocationErrors { get; set; }
+
+    [JsonPropertyName("hash_errors")]
+    public int HashErrors { get; set; }
+
     [JsonPropertyName("all_valid")]
     public bool AllValid { get; set; }
 }

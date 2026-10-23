@@ -32,7 +32,7 @@ public class FileService : IFileService
         return false;
     }
 
-    public IEnumerable<string> GetFilteredFiles(string directory)
+    public IEnumerable<string> GetFilteredFiles(string directory, bool strict = false)
     {
         var stack = new Stack<string>();
         stack.Push(directory);
@@ -48,21 +48,45 @@ public class FileService : IFileService
             }
             catch (UnauthorizedAccessException ex)
             {
+                if (strict)
+                    throw;
                 _logger.Verbose($"Access denied: {dir} - {ex.Message}");
             }
             catch (DirectoryNotFoundException)
             {
+                if (strict)
+                    throw;
                 _logger.Verbose($"Directory not found: {dir}");
             }
             catch (Exception ex)
             {
+                if (strict)
+                    throw;
                 _logger.Verbose($"Error accessing {dir}: {ex.Message}");
             }
 
             foreach (var file in files)
             {
-                if (!ShouldFilter(file))
-                    yield return file;
+                if (ShouldFilter(file))
+                    continue;
+
+                try
+                {
+                    if ((File.GetAttributes(file) & FileAttributes.ReparsePoint) != 0)
+                    {
+                        _logger.Verbose($"Skipping symlink: {file}");
+                        continue;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    if (strict)
+                        throw;
+                    _logger.Verbose($"Could not read attributes for {file}: {ex.Message}");
+                    continue;
+                }
+
+                yield return file;
             }
 
             try
@@ -83,15 +107,29 @@ public class FileService : IFileService
                     }
                     catch (Exception ex)
                     {
+                        if (strict)
+                            throw;
                         _logger.Verbose($"Could not read attributes for {subdir}: {ex.Message}");
                     }
 
                     stack.Push(subdir);
                 }
             }
-            catch (UnauthorizedAccessException) { }
-            catch (DirectoryNotFoundException) { }
-            catch { }
+            catch (UnauthorizedAccessException)
+            {
+                if (strict)
+                    throw;
+            }
+            catch (DirectoryNotFoundException)
+            {
+                if (strict)
+                    throw;
+            }
+            catch
+            {
+                if (strict)
+                    throw;
+            }
         }
     }
 

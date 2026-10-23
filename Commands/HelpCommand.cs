@@ -29,7 +29,7 @@ ANALYSIS:
   ext <dir>                 List file extensions
   empty <dir>               Find empty folders
   tree <dir>                Show folder structure
-  check <dir>               Detect corrupt files
+  check <dir>               Screen files for read errors and basic format signatures
 
 COMPARISON:
   compare <dir1> <dir2>               Compare folders by name
@@ -51,6 +51,9 @@ OPTIONS:
   -v, --verbose    Show detailed output
   -q, --quiet      Show errors only
   -y, --yes        Auto-confirm all prompts
+
+The check command is a basic screen, not a full media decoder.
+Comparison with --extract prompts before moving files.
 "
         );
         return 0;

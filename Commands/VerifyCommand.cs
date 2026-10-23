@@ -38,15 +38,12 @@ public class VerifyCommand : BaseCommand
 
         FileService.RequireDirectory(sortedDir, "Sorted directory");
 
-        if (sourceDir == null)
-            VerifyQuick(sortedDir!);
-        else
-            VerifyFull(sortedDir!, sourceDir);
-
-        return 0;
+        return sourceDir == null
+            ? VerifyQuick(sortedDir!) ? 0 : 1
+            : VerifyFull(sortedDir!, sourceDir) ? 0 : 1;
     }
 
-    private void VerifyQuick(string targetDir)
+    private bool VerifyQuick(string targetDir)
     {
         Logger.Header("Quick Verification");
         Logger.Info($"Directory: {targetDir}");
@@ -61,12 +58,16 @@ public class VerifyCommand : BaseCommand
         {
             foreach (var categoryDir in Directory.GetDirectories(targetDir))
             {
+                if (ShouldSkipPath(categoryDir))
+                    continue;
                 var categoryName = Path.GetFileName(categoryDir);
                 if (categoryName.Equals("logs", StringComparison.OrdinalIgnoreCase))
                     continue;
 
                 foreach (var extDir in Directory.GetDirectories(categoryDir))
                 {
+                    if (ShouldSkipPath(extDir))
+                        continue;
                     var ext = Path.GetFileName(extDir).ToLower();
                     var extUpper = ext.ToUpper();
 
@@ -77,8 +78,8 @@ public class VerifyCommand : BaseCommand
                             : null;
 
                     if (
-                        expectedDisplay != null
-                        && !expectedDisplay.Equals(categoryName, StringComparison.OrdinalIgnoreCase)
+                        expectedDisplay == null
+                        || !expectedDisplay.Equals(categoryName, StringComparison.OrdinalIgnoreCase)
                     )
                     {
                         Logger.Info(
@@ -87,9 +88,9 @@ public class VerifyCommand : BaseCommand
                         locationErrors++;
                     }
 
-                    var pattern = $"{extUpper}*.{ext}";
                     var files = Directory
-                        .GetFiles(extDir, pattern)
+                        .GetFiles(extDir)
+                        .Where(file => !ShouldSkipPath(file))
                         .OrderBy(f => f, NaturalStringComparer.Instance)
                         .ToList();
 
@@ -108,7 +109,7 @@ public class VerifyCommand : BaseCommand
 
                         var match = Regex.Match(
                             fileName,
-                            $@"^{extUpper}(\d+)\.{ext}$",
+                            $@"^{Regex.Escape(extUpper)}(\d+)\.{Regex.Escape(ext)}$",
                             RegexOptions.IgnoreCase
                         );
                         if (!match.Success)
@@ -118,7 +119,11 @@ public class VerifyCommand : BaseCommand
                             continue;
                         }
 
-                        var actualRank = int.Parse(match.Groups[1].Value);
+                        if (!int.TryParse(match.Groups[1].Value, out var actualRank))
+                        {
+                            namingErrors++;
+                            continue;
+                        }
                         if (actualRank != expectedRank)
                         {
                             Logger.Verbose(
@@ -143,7 +148,16 @@ public class VerifyCommand : BaseCommand
         catch (Exception ex)
         {
             Logger.Error($"Verification failed: {ex.Message}");
-            return;
+            return false;
+        }
+
+        var scannedFiles = FileService.GetFilteredFiles(targetDir, strict: true)
+            .Count(file => !IsInLogs(targetDir, file));
+        if (scannedFiles > totalFiles)
+        {
+            var ignoredFiles = scannedFiles - totalFiles;
+            Logger.Info($"  [X] Files outside expected folders: {ignoredFiles}");
+            locationErrors += ignoredFiles;
         }
 
         var totalErrors = namingErrors + sortingErrors + locationErrors;
@@ -166,9 +180,10 @@ public class VerifyCommand : BaseCommand
 
         Logger.Info($"  Total files: {totalFiles}");
         Logger.Info("");
+        return totalErrors == 0;
     }
 
-    private void VerifyFull(string sortedDir, string sourceDir)
+    private bool VerifyFull(string sortedDir, string sourceDir)
     {
         FileService.RequireDirectory(sourceDir, "Source directory");
 
@@ -181,13 +196,11 @@ public class VerifyCommand : BaseCommand
         Directory.CreateDirectory(logDir);
         var logFile = Path.Combine(logDir, $"verify_{DateTime.Now:yyyyMMdd_HHmmss}.json");
 
-        var sourceFiles = FileService.GetFilteredFiles(sourceDir).ToList();
+        var sourceFiles = FileService.GetFilteredFiles(sourceDir, strict: true).ToList();
 
         var sortedFiles = FileService
-            .GetFilteredFiles(sortedDir)
-            .Where(f =>
-                !f.Contains($"{Path.DirectorySeparatorChar}logs{Path.DirectorySeparatorChar}")
-            )
+            .GetFilteredFiles(sortedDir, strict: true)
+            .Where(f => !IsInLogs(sortedDir, f))
             .ToList();
 
         Logger.Info($"Sorted: {sortedFiles.Count} files");
@@ -199,6 +212,7 @@ public class VerifyCommand : BaseCommand
             new ConcurrentDictionary<string, ConcurrentBag<(string Path, long Size)>>();
         var processed = 0;
         var total = sourceFiles.Count;
+        var hashErrors = 0;
 
         Parallel.ForEach(
             sourceFiles,
@@ -212,6 +226,10 @@ public class VerifyCommand : BaseCommand
                     var bag = sourceHashes.GetOrAdd(hash, _ => new ConcurrentBag<(string, long)>());
                     bag.Add((file, size));
                 }
+                else
+                {
+                    Interlocked.Increment(ref hashErrors);
+                }
 
                 var current = Interlocked.Increment(ref processed);
                 if (current % 100 == 0 || current == total)
@@ -224,25 +242,31 @@ public class VerifyCommand : BaseCommand
         var results = new ConcurrentBag<VerifyFileResult>();
         int totalDuplicates = 0,
             sortingErrors = 0,
-            unmatched = 0;
+            unmatched = 0,
+            namingErrors = 0,
+            locationErrors = 0;
 
         foreach (var category in new[] { "photos", "videos", "audio" })
         {
             var categoryDisplay = CategoryConfiguration.GetCategoryDisplay(category);
             var categoryDir = Path.Combine(sortedDir, categoryDisplay);
-            if (!Directory.Exists(categoryDir))
+            if (!Directory.Exists(categoryDir) || ShouldSkipPath(categoryDir))
                 continue;
 
             Logger.Info($"[{categoryDisplay}]");
 
             foreach (var extDir in Directory.GetDirectories(categoryDir))
             {
+                if (ShouldSkipPath(extDir))
+                    continue;
                 var ext = Path.GetFileName(extDir).ToLower();
                 var extUpper = ext.ToUpper();
-                var pattern = $"{extUpper}*.{ext}";
+                if (CategoryConfiguration.GetCategory(ext) != category)
+                    locationErrors++;
 
                 var files = Directory
-                    .GetFiles(extDir, pattern)
+                    .GetFiles(extDir)
+                    .Where(file => !ShouldSkipPath(file))
                     .OrderBy(f => f, NaturalStringComparer.Instance)
                     .ToList();
 
@@ -255,17 +279,23 @@ public class VerifyCommand : BaseCommand
                 foreach (var file in files)
                 {
                     var fileName = Path.GetFileName(file);
-                    if (
-                        !Regex.IsMatch(
-                            fileName,
-                            $@"^{extUpper}\d+\.{ext}$",
-                            RegexOptions.IgnoreCase
-                        )
-                    )
+                    var match = Regex.Match(
+                        fileName,
+                        $@"^{Regex.Escape(extUpper)}(\d+)\.{Regex.Escape(ext)}$",
+                        RegexOptions.IgnoreCase
+                    );
+                    if (!match.Success || !int.TryParse(match.Groups[1].Value, out var actualRank))
+                    {
+                        namingErrors++;
                         continue;
+                    }
 
                     rank++;
+                    if (actualRank != rank)
+                        namingErrors++;
                     var hash = HashService.ComputeHash(file);
+                    if (string.IsNullOrEmpty(hash))
+                        hashErrors++;
                     var size = FileService.GetFileSize(file);
 
                     var rankValid = size <= prevSize;
@@ -325,8 +355,20 @@ public class VerifyCommand : BaseCommand
 
         Logger.Info("");
 
-        var allValid = sortingErrors == 0 && unmatched == 0;
         var resultList = results.OrderBy(r => r.SortedPath).ToList();
+        var sortedHashes = resultList.Select(r => r.Hash).Where(h => h.Length > 0).ToHashSet();
+        var missingSourceFiles = sourceHashes
+            .Where(group => !sortedHashes.Contains(group.Key))
+            .Sum(group => group.Value.Count);
+        var ignoredFiles = sortedFiles.Count - resultList.Count;
+        var allValid =
+            sortingErrors == 0
+            && unmatched == 0
+            && missingSourceFiles == 0
+            && ignoredFiles == 0
+            && namingErrors == 0
+            && locationErrors == 0
+            && hashErrors == 0;
 
         for (int i = 0; i < resultList.Count; i++)
             resultList[i].Id = i + 1;
@@ -346,6 +388,11 @@ public class VerifyCommand : BaseCommand
                 TotalDuplicates = totalDuplicates,
                 SortingErrors = sortingErrors,
                 UnmatchedFiles = unmatched,
+                MissingSourceFiles = missingSourceFiles,
+                IgnoredFiles = ignoredFiles,
+                NamingErrors = namingErrors,
+                LocationErrors = locationErrors,
+                HashErrors = hashErrors,
                 AllValid = allValid,
             },
             Files = resultList,
@@ -372,7 +419,24 @@ public class VerifyCommand : BaseCommand
         Logger.Info($"  Duplicates: {totalDuplicates}");
         Logger.Info($"  Sorting errors: {sortingErrors}");
         Logger.Info($"  Unmatched: {unmatched}");
+        Logger.Info($"  Missing source files: {missingSourceFiles}");
+        Logger.Info($"  Invalid or ignored files: {ignoredFiles}");
+        Logger.Info($"  Naming errors: {namingErrors}");
+        Logger.Info($"  Location errors: {locationErrors}");
+        Logger.Info($"  Hash errors: {hashErrors}");
         Logger.Info($"  Report: {logFile}");
         Logger.Info("");
+        return allValid;
+    }
+
+    private bool ShouldSkipPath(string path) =>
+        FileService.ShouldFilter(path)
+        || (File.GetAttributes(path) & FileAttributes.ReparsePoint) != 0;
+
+    private static bool IsInLogs(string root, string file)
+    {
+        var relative = Path.GetRelativePath(root, file);
+        return relative.Split(Path.DirectorySeparatorChar)[0]
+            .Equals("logs", StringComparison.OrdinalIgnoreCase);
     }
 }

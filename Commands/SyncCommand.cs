@@ -63,7 +63,7 @@ public class SyncCommand : BaseCommand
         else
         {
             FileService.RequireDirectory(sourceDir, "Media directory");
-            SyncUpdate(sourceDir!, dryRun, autoYes);
+            return SyncUpdate(sourceDir!, dryRun, autoYes) ? 0 : 1;
         }
 
         return 0;
@@ -79,7 +79,7 @@ public class SyncCommand : BaseCommand
         Logger.Info("");
 
         var allFiles = FileService
-            .GetFilteredFiles(sourceDir)
+            .GetFilteredFiles(sourceDir, strict: true)
             .Where(f =>
                 !f.Contains($"{Path.DirectorySeparatorChar}logs{Path.DirectorySeparatorChar}")
             )
@@ -152,8 +152,20 @@ public class SyncCommand : BaseCommand
                 foreach (var file in files)
                 {
                     var hash = HashService.ComputeHash(file.Path);
+                    if (string.IsNullOrEmpty(hash))
+                        throw new IOException($"Could not hash source file: {file.Path}");
+
                     var newName = $"{extUpper}{counter}.{ext}";
                     var targetFile = Path.Combine(targetSubDir, newName);
+
+                    if (!dryRun)
+                    {
+                        if (!FileService.TrySafeCopy(file.Path, targetFile))
+                            throw new IOException($"Could not copy source file to: {targetFile}");
+
+                        if (HashService.ComputeHash(targetFile) != hash)
+                            throw new IOException($"Copied file failed hash verification: {targetFile}");
+                    }
 
                     fileEntries.Add(
                         new MediaFileEntry
@@ -171,9 +183,6 @@ public class SyncCommand : BaseCommand
                             Status = "active",
                         }
                     );
-
-                    if (!dryRun)
-                        FileService.TrySafeCopy(file.Path, targetFile);
 
                     counter++;
                     totalFiles++;
@@ -218,7 +227,7 @@ public class SyncCommand : BaseCommand
         Logger.Info("");
     }
 
-    private void SyncUpdate(string mediaDir, bool dryRun, bool autoYes)
+    private bool SyncUpdate(string mediaDir, bool dryRun, bool autoYes)
     {
         Logger.Header("Synchronization");
         if (dryRun)
@@ -235,9 +244,6 @@ public class SyncCommand : BaseCommand
                 "current.json not found. For initial setup use: media-stow sync --init <source> [target]"
             );
 
-        if (!dryRun)
-            Directory.CreateDirectory(changesDir);
-
         int currentVersion = 0;
         if (Directory.Exists(changesDir))
         {
@@ -252,10 +258,6 @@ public class SyncCommand : BaseCommand
                 currentVersion = int.Parse(lastChange.Substring(1));
         }
 
-        int newVersion = currentVersion + 1;
-        Logger.Info($"Version: v{currentVersion} -> v{newVersion}");
-        Logger.Info("");
-
         MediaIndex index;
         try
         {
@@ -266,6 +268,11 @@ public class SyncCommand : BaseCommand
         {
             throw new InvalidOperationException($"Failed to parse current.json: {ex.Message}");
         }
+
+        currentVersion = Math.Max(currentVersion, index.Metadata.Version);
+        int newVersion = currentVersion + 1;
+        Logger.Info($"Version: v{currentVersion} -> v{newVersion}");
+        Logger.Info("");
 
         var activeEntries = index.Files.Where(f => f.Status == "active").ToList();
         foreach (var entry in activeEntries)
@@ -286,7 +293,7 @@ public class SyncCommand : BaseCommand
 
         var jsonFiles = activeEntries.ToLookup(f => f.Hash);
 
-        Logger.Info($"Index: {jsonFiles.Count} active files");
+        Logger.Info($"Index: {activeEntries.Count} active files");
         Logger.Info("Scanning disk...");
 
         var diskFiles = new Dictionary<string, List<string>>();
@@ -294,10 +301,10 @@ public class SyncCommand : BaseCommand
         var wrongLocation = new List<(string Path, string ExpectedTarget)>();
         int totalDiskFiles = 0;
 
-        foreach (var file in FileService.GetFilteredFiles(mediaDir))
+        foreach (var file in FileService.GetFilteredFiles(mediaDir, strict: true))
         {
             var relPath = Path.GetRelativePath(mediaDir, file);
-            if (relPath.StartsWith("logs"))
+            if (relPath.Split(Path.DirectorySeparatorChar)[0].Equals("logs", StringComparison.OrdinalIgnoreCase))
                 continue;
 
             totalDiskFiles++;
@@ -309,7 +316,7 @@ public class SyncCommand : BaseCommand
 
             var hash = HashService.ComputeHash(file);
             if (string.IsNullOrEmpty(hash))
-                continue;
+                throw new IOException($"Could not hash media file: {file}");
 
             if (!diskFiles.TryGetValue(hash, out var diskList))
             {
@@ -327,34 +334,71 @@ public class SyncCommand : BaseCommand
             var extFolder = pathParts.Length > 1 ? pathParts[1] : "";
 
             var isCorrect =
-                currentCategory.Equals(expectedDisplay, StringComparison.OrdinalIgnoreCase)
+                pathParts.Length == 3
+                && currentCategory.Equals(expectedDisplay, StringComparison.OrdinalIgnoreCase)
                 && extFolder.Equals(ext, StringComparison.OrdinalIgnoreCase)
                 && Regex.IsMatch(fileName, $@"^{extUpper}\d+\.{ext}$", RegexOptions.IgnoreCase);
 
             if (!isCorrect)
                 wrongLocation.Add((file, $"{expectedDisplay}/{ext}"));
 
-            if (!jsonFiles.Contains(hash))
-                newFiles.Add((file, hash));
         }
 
-        var deletedHashes = jsonFiles.Select(g => g.Key).Except(diskFiles.Keys).ToList();
+        foreach (var (hash, paths) in diskFiles)
+        {
+            var extraCount = paths.Count - jsonFiles[hash].Count();
+            if (extraCount <= 0)
+                continue;
+
+            var indexedPaths = jsonFiles[hash]
+                .Select(e => Path.GetFullPath(Path.Combine(mediaDir, e.SortedPath)))
+                .ToHashSet();
+            newFiles.AddRange(
+                paths.OrderBy(path => indexedPaths.Contains(Path.GetFullPath(path)) ? 1 : 0)
+                    .Take(extraCount)
+                    .Select(path => (path, hash))
+            );
+        }
+
+        var diskPaths = diskFiles.Values.SelectMany(paths => paths).Select(Path.GetFullPath).ToHashSet();
+        var deletedEntries = activeEntries
+            .GroupBy(e => e.Hash)
+            .SelectMany(group =>
+            {
+                var diskCount = diskFiles.TryGetValue(group.Key, out var paths) ? paths.Count : 0;
+                var matchingPaths = (paths ?? [])
+                    .Select(Path.GetFullPath)
+                    .ToHashSet();
+                return group
+                    .OrderBy(e =>
+                    {
+                        var path = Path.GetFullPath(Path.Combine(mediaDir, e.SortedPath));
+                        // Preserve matching paths; a different hash proves the old content was replaced.
+                        return matchingPaths.Contains(path) ? 2 : diskPaths.Contains(path) ? 0 : 1;
+                    })
+                    .Take(Math.Max(0, group.Count() - diskCount));
+            })
+            .ToList();
+
+        var indexPaths = activeEntries.Select(e => Path.GetFullPath(Path.Combine(mediaDir, e.SortedPath))).ToHashSet();
+        var indexNeedsRefresh = !indexPaths.SetEquals(diskPaths);
 
         Logger.Info($"Disk: {totalDiskFiles} files");
         Logger.Info("");
         Logger.Info("Changes detected:");
         Logger.Info($"  New files: {newFiles.Count}");
         Logger.Info($"  Wrong location: {wrongLocation.Count}");
-        Logger.Info($"  Deleted: {deletedHashes.Count}");
+        Logger.Info($"  Deleted: {deletedEntries.Count}");
         Logger.Info("");
 
-        if (newFiles.Count == 0 && wrongLocation.Count == 0 && deletedHashes.Count == 0)
+        if (newFiles.Count == 0 && wrongLocation.Count == 0 && deletedEntries.Count == 0 && !indexNeedsRefresh)
         {
             Logger.Info("[OK] Everything is synchronized.");
-            return;
+            return true;
         }
 
         var filesToProcess = new List<(string Path, string Target)>();
+        var declinedMove = false;
 
         foreach (var (path, target) in wrongLocation)
         {
@@ -369,7 +413,15 @@ public class SyncCommand : BaseCommand
                 );
                 if (UserInteraction.Confirm("  Move?"))
                     filesToProcess.Add((path, target));
+                else
+                    declinedMove = true;
             }
+        }
+
+        if (declinedMove)
+        {
+            Logger.Info("Cancelled: a misplaced file was not approved for moving.");
+            return false;
         }
 
         foreach (var (path, hash) in newFiles)
@@ -384,10 +436,10 @@ public class SyncCommand : BaseCommand
                 filesToProcess.Add((path, target));
         }
 
-        if (filesToProcess.Count == 0 && deletedHashes.Count == 0)
+        if (filesToProcess.Count == 0 && deletedEntries.Count == 0 && !indexNeedsRefresh)
         {
             Logger.Info("[OK] No actions needed.");
-            return;
+            return true;
         }
 
         if (!dryRun && !autoYes && filesToProcess.Count > 0)
@@ -396,7 +448,7 @@ public class SyncCommand : BaseCommand
             if (!UserInteraction.Confirm($"Process {filesToProcess.Count} files?"))
             {
                 Logger.Info("Cancelled.");
-                return;
+                return false;
             }
         }
 
@@ -404,6 +456,20 @@ public class SyncCommand : BaseCommand
         Logger.Info("Processing...");
 
         var affectedExtensions = new HashSet<string>();
+        foreach (var entry in deletedEntries)
+        {
+            if (CategoryConfiguration.GetCategory(entry.Extension) is { } category)
+                affectedExtensions.Add($"{CategoryConfiguration.GetCategoryDisplay(category)}/{entry.Extension}");
+        }
+        foreach (var file in diskFiles.Values.SelectMany(paths => paths))
+        {
+            if (indexPaths.Contains(Path.GetFullPath(file)))
+                continue;
+
+            var ext = Path.GetExtension(file).TrimStart('.').ToLowerInvariant();
+            if (CategoryConfiguration.GetCategory(ext) is { } category)
+                affectedExtensions.Add($"{CategoryConfiguration.GetCategoryDisplay(category)}/{ext}");
+        }
 
         if (!dryRun)
         {
@@ -415,7 +481,7 @@ public class SyncCommand : BaseCommand
                 );
                 affectedExtensions.Add(target);
 
-                if (!path.StartsWith(extDir))
+                if (Path.GetFullPath(Path.GetDirectoryName(path)!) != Path.GetFullPath(extDir))
                 {
                     Directory.CreateDirectory(extDir);
                     var tempName = $"__new_{Guid.NewGuid():N}_{Path.GetFileName(path)}";
@@ -425,7 +491,7 @@ public class SyncCommand : BaseCommand
                     }
                     catch (Exception ex)
                     {
-                        Logger.Warning($"Failed to move: {Path.GetFileName(path)} - {ex.Message}");
+                        throw new IOException($"Failed to move {path} to {extDir}", ex);
                     }
                 }
             }
@@ -436,6 +502,8 @@ public class SyncCommand : BaseCommand
                     mediaDir,
                     target.Replace('/', Path.DirectorySeparatorChar)
                 );
+                if (!Directory.Exists(extDir))
+                    continue;
                 var ext = target.Split('/').Last();
                 var extUpper = ext.ToUpper();
 
@@ -443,6 +511,7 @@ public class SyncCommand : BaseCommand
 
                 var files = Directory
                     .GetFiles(extDir)
+                    .Where(file => Path.GetExtension(file).Equals($".{ext}", StringComparison.OrdinalIgnoreCase))
                     .Select(f => new { Path = f, Size = FileService.GetFileSize(f) })
                     .OrderByDescending(f => f.Size)
                     .ToList();
@@ -515,7 +584,7 @@ public class SyncCommand : BaseCommand
                         }
                         catch { }
                     }
-                    continue;
+                    throw new IOException($"Could not reorganize files in {extDir}");
                 }
 
                 Logger.Info($"    {files.Count} files");
@@ -523,6 +592,7 @@ public class SyncCommand : BaseCommand
 
             Logger.Info("Updating index...");
 
+            Directory.CreateDirectory(changesDir);
             var changeJson = Path.Combine(changesDir, $"v{newVersion}.json");
             var changes = new
             {
@@ -535,7 +605,7 @@ public class SyncCommand : BaseCommand
                 changes = new
                 {
                     added = newFiles.Count,
-                    deleted = deletedHashes.Count,
+                    deleted = deletedEntries.Count,
                     moved = wrongLocation.Count,
                 },
             };
@@ -553,22 +623,11 @@ public class SyncCommand : BaseCommand
             foreach (var entry in index.Files.Where(f => f.Status == "deleted"))
                 newEntries.Add(entry);
 
-            foreach (var hash in deletedHashes)
+            foreach (var old in deletedEntries)
             {
-                if (jsonFiles.Contains(hash))
-                {
-                    var old = jsonFiles[hash].First();
-                    newEntries.Add(
-                        new MediaFileEntry
-                        {
-                            Hash = hash,
-                            SortedPath = old.SortedPath,
-                            AddedInVersion = old.AddedInVersion,
-                            Status = "deleted",
-                            DeletedInVersion = newVersion,
-                        }
-                    );
-                }
+                old.Status = "deleted";
+                old.DeletedInVersion = newVersion;
+                newEntries.Add(old);
             }
 
             int totalActive = 0;
@@ -657,8 +716,9 @@ public class SyncCommand : BaseCommand
         Logger.Info("SUMMARY:");
         Logger.Info($"  Added: {newFiles.Count}");
         Logger.Info($"  Moved: {wrongLocation.Count}");
-        Logger.Info($"  Deleted: {deletedHashes.Count}");
+        Logger.Info($"  Deleted: {deletedEntries.Count}");
         Logger.Info("[OK] Synchronization complete!");
         Logger.Info("");
+        return true;
     }
 }

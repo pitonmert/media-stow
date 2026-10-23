@@ -9,7 +9,7 @@ MediaStow is a high-performance command-line interface (CLI) utility built with 
 - **Verification (`verify`)**: Verify the structural integrity of your sorted media directory to ensure that no files are missing, misplaced, or incorrectly ranked.
 - **Common Extraction (`extract-common`)**: Compare two directories and safely extract/move files that exist in both locations to target directories.
 - **Log Comparison (`compare-logs`)**: Analyze and compare large JSON log outputs to track differences in sync states.
-- **Health Check (`check`)**: Quickly scan directories for inaccessible or corrupted files.
+- **Health Check (`check`)**: Read media files and screen common formats for invalid signatures. This is a basic check and does not fully decode media content.
 
 ## Installation
 
@@ -49,6 +49,10 @@ media-stow sync [-n] [-y] <mediaDir>             # update/sync
 media-stow dedup [-n] <sourceDir> [targetDir]
 ```
 
+Use `dedup -n -v <sourceDir>` to preview the SHA-256 groups and individual paths without changing the source directory. A real `dedup` run moves one file from each group into `<sourceDir>/duplicates` (or the specified target) and deletes the remaining copies after confirmation. Matching names or sizes alone do not establish that files are duplicates.
+
+Recursive scans skip symbolic links to files and directories. Links are not treated as independent content copies by `dedup`.
+
 **Verify Structure:**
 ```bash
 media-stow verify <sortedDir> [sourceDir]
@@ -58,6 +62,9 @@ media-stow verify <sortedDir> [sourceDir]
 ```bash
 media-stow extract-common <icloudDir> <mediaDir> <targetBase>
 ```
+
+`compare --extract=<directory>` asks for confirmation before moving differing files.
+`check` and `verify` return a nonzero exit code when they find problems.
 
 ## License
 

@@ -47,7 +47,22 @@ public class DedupCommand : BaseCommand
         Logger.Info($"Target: {targetDir}");
         Logger.Info("");
 
-        var files = FileService.GetFilteredFiles(sourceDir!).ToList();
+        var targetRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(targetDir!));
+        var sourceRoot = Path.TrimEndingDirectorySeparator(Path.GetFullPath(sourceDir!));
+        if (targetRoot.Equals(sourceRoot, StringComparison.OrdinalIgnoreCase))
+            throw new ArgumentException("Source and target directories must be different.");
+
+        var sourcePrefix = Path.EndsInDirectorySeparator(sourceRoot)
+            ? sourceRoot
+            : sourceRoot + Path.DirectorySeparatorChar;
+        var targetIsInsideSource = targetRoot.StartsWith(sourcePrefix, StringComparison.OrdinalIgnoreCase);
+
+        var files = FileService.GetFilteredFiles(sourceDir!, strict: true)
+            .Where(file => !targetIsInsideSource || !Path.GetFullPath(file).StartsWith(
+                targetRoot + Path.DirectorySeparatorChar,
+                StringComparison.OrdinalIgnoreCase
+            ))
+            .ToList();
         Logger.Info($"Scanning {files.Count} files...");
         Logger.Info("");
 
@@ -192,11 +207,13 @@ public class DedupCommand : BaseCommand
 
         int groups = 0,
             moved = 0,
-            deleted = 0;
+            deleted = 0,
+            failed = 0;
         long savedBytes = 0;
 
         var logDir = Path.Combine(sourceDir!, "logs");
-        Directory.CreateDirectory(logDir);
+        if (!dryRun)
+            Directory.CreateDirectory(logDir);
         var logFile = Path.Combine(logDir, $"dedup_{DateTime.Now:yyyyMMdd_HHmmss}.txt");
         var logLines = new List<string>();
 
@@ -210,45 +227,78 @@ public class DedupCommand : BaseCommand
 
             logLines.Add($"[{groups}] {fileName} (hash: {hash})");
             logLines.Add($"  Keep: {firstFile}");
+            Logger.Verbose($"[{groups}] Keep: {firstFile} (SHA-256: {group.Key})");
+
+            if (!dryRun)
+            {
+                if (list.Any(file => HashService.TryComputeHash(file) != group.Key))
+                {
+                    Logger.Warning($"Files changed during scan; skipped group: {fileName}");
+                    failed++;
+                    continue;
+                }
+
+                var targetFolder = Path.Combine(targetDir!, $"{fileName}_{hash}");
+                var targetPath = Path.Combine(targetFolder, fileName);
+                var keeperMoved = false;
+                try
+                {
+                    Directory.CreateDirectory(targetFolder);
+                    File.Move(firstFile, targetPath);
+                    keeperMoved = true;
+                    if (HashService.ComputeHash(targetPath) != group.Key)
+                        throw new IOException($"Keeper failed hash verification: {targetPath}");
+
+                    var sourcesFile = Path.Combine(targetFolder, "_sources.txt");
+                    File.WriteAllLines(sourcesFile, list);
+                    moved++;
+                }
+                catch (Exception ex)
+                {
+                    if (keeperMoved)
+                    {
+                        try
+                        {
+                            File.Move(targetPath, firstFile);
+                        }
+                        catch (Exception rollbackError)
+                        {
+                            Logger.Warning($"Could not restore keeper to {firstFile}: {rollbackError.Message}");
+                        }
+                    }
+                    Logger.Warning($"Failed to preserve keeper: {fileName} - {ex.Message}");
+                    failed++;
+                    continue;
+                }
+            }
 
             for (int i = 1; i < list.Count; i++)
             {
                 var dup = list[i];
                 var dupSize = FileService.GetFileSize(dup);
-                savedBytes += dupSize;
 
                 logLines.Add($"  Delete: {dup} ({ByteFormatter.Format(dupSize)})");
+                Logger.Verbose($"[{groups}] Duplicate: {dup} ({ByteFormatter.Format(dupSize)})");
 
-                if (!dryRun)
+                if (dryRun)
+                {
+                    savedBytes += dupSize;
+                }
+                else
                 {
                     try
                     {
+                        if (HashService.TryComputeHash(dup) != group.Key)
+                            throw new IOException($"File changed before deletion: {dup}");
                         File.Delete(dup);
                         deleted++;
+                        savedBytes += dupSize;
                     }
                     catch (Exception ex)
                     {
                         Logger.Warning($"Failed to delete: {dup} - {ex.Message}");
+                        failed++;
                     }
-                }
-            }
-
-            if (!dryRun)
-            {
-                var targetFolder = Path.Combine(targetDir!, $"{fileName}_{hash}");
-                try
-                {
-                    Directory.CreateDirectory(targetFolder);
-                    var targetPath = Path.Combine(targetFolder, fileName);
-                    File.Move(firstFile, targetPath);
-                    moved++;
-
-                    var sourcesFile = Path.Combine(targetFolder, "_sources.txt");
-                    File.WriteAllLines(sourcesFile, list);
-                }
-                catch (Exception ex)
-                {
-                    Logger.Warning($"Failed to move: {fileName} - {ex.Message}");
                 }
             }
 
@@ -267,11 +317,12 @@ public class DedupCommand : BaseCommand
         Logger.Info($"  Groups: {groups}");
         Logger.Info($"  Moved: {moved}");
         Logger.Info($"  Deleted: {deleted}");
+        Logger.Info($"  Failed groups or deletions: {failed}");
         Logger.Info($"  Saved: {ByteFormatter.Format(savedBytes)}");
         if (!dryRun)
             Logger.Info($"  Log: {logFile}");
         Logger.Info("");
 
-        return 0;
+        return failed == 0 ? 0 : 1;
     }
 }

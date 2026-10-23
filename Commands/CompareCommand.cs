@@ -93,6 +93,7 @@ public class CompareCommand : BaseCommand
             different = 0,
             nameOnly = 0,
             extractCount = 0;
+        bool? extractApproved = null;
 
         for (int i = 0; i < commonFolders.Count; i++)
         {
@@ -155,30 +156,34 @@ public class CompareCommand : BaseCommand
 
                 if (extractDir != null)
                 {
-                    foreach (var hash in onlyIn1)
+                    extractApproved ??= UserInteraction.Confirm("Move differing files to extract directory?");
+                    if (extractApproved.Value)
                     {
-                        var src = hashes1[hash];
-                        var dst = Path.Combine(
-                            extractDir,
-                            folder,
-                            Path.GetFileName(dir1),
-                            Path.GetFileName(src)
-                        );
-                        if (FileService.TrySafeMove(src, dst))
-                            extractCount++;
-                    }
+                        foreach (var hash in onlyIn1)
+                        {
+                            var src = hashes1[hash];
+                            var dst = Path.Combine(
+                                extractDir,
+                                folder,
+                                Path.GetFileName(dir1),
+                                Path.GetFileName(src)
+                            );
+                            if (FileService.TrySafeMove(src, dst))
+                                extractCount++;
+                        }
 
-                    foreach (var hash in onlyIn2)
-                    {
-                        var src = hashes2[hash];
-                        var dst = Path.Combine(
-                            extractDir,
-                            folder,
-                            Path.GetFileName(dir2),
-                            Path.GetFileName(src)
-                        );
-                        if (FileService.TrySafeMove(src, dst))
-                            extractCount++;
+                        foreach (var hash in onlyIn2)
+                        {
+                            var src = hashes2[hash];
+                            var dst = Path.Combine(
+                                extractDir,
+                                folder,
+                                Path.GetFileName(dir2),
+                                Path.GetFileName(src)
+                            );
+                            if (FileService.TrySafeMove(src, dst))
+                                extractCount++;
+                        }
                     }
                 }
             }
@@ -236,6 +241,11 @@ public class CompareCommand : BaseCommand
         Logger.Info($"  Common: {common} unique files");
 
         int extractCount = 0;
+        if (extractDir != null && (only1.Count > 0 || only2.Count > 0))
+        {
+            if (!UserInteraction.Confirm("Move differing files to extract directory?"))
+                extractDir = null;
+        }
 
         if (only1.Count > 0)
         {

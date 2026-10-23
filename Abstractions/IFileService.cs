@@ -2,7 +2,7 @@ namespace MediaStow.Abstractions;
 
 public interface IFileService
 {
-    IEnumerable<string> GetFilteredFiles(string directory);
+    IEnumerable<string> GetFilteredFiles(string directory, bool strict = false);
     bool ShouldFilter(string path);
     bool TrySafeMove(string source, string destination);
     bool TrySafeCopy(string source, string destination);
