@@ -29,10 +29,14 @@ You can run the utility directly via the CLI:
 dotnet run --project MediaStow.csproj -- --help
 ```
 
-*Alternatively, you can publish it as a standalone executable:*
+Publish a framework-dependent executable (the .NET 10 runtime must be installed):
+
 ```bash
-dotnet publish -c Release
+dotnet publish MediaStow.csproj -c Release -o dist/media-stow
+./dist/media-stow/media-stow help
 ```
+
+From another directory, invoke the executable by its absolute path.
 
 ## Usage
 
